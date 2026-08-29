@@ -6,7 +6,329 @@
 #include "be_constobj.h"
 #include "be_ctypes.h"
 #include "be_mapping.h"
-#include "be_ctypes.h"
+#include <stdbool.h>
+
+extern bool DeviceGroupGetMemberShadow(
+  uint8_t group_index,
+  uint8_t member_index,
+  uint32_t *ip,
+  uint8_t *valid,
+  uint32_t *power,
+  uint8_t *bri,
+  uint8_t channels[6],
+  uint16_t *ct,
+  uint32_t *age
+);
+
+static int l_devgroup_shadow(bvm *vm)
+{
+  int32_t index = 0;
+
+  if (be_top(vm) >= 2) {
+    index = be_toint(vm, 2);
+  }
+
+  if (index < 0 || index > 255) {
+    be_pushnil(vm);
+    be_return(vm);
+  }
+
+  uint8_t valid = 0;
+  uint32_t power = 0;
+  uint8_t bri = 0;
+  uint8_t channels[6] = {0};
+  uint16_t ct = 0;
+  uint32_t age = 0;
+
+  bool ok = DeviceGroupGetShadow(
+    (uint8_t)index,
+    &valid,
+    &power,
+    &bri,
+    channels,
+    &ct,
+    &age
+  );
+
+  if (!ok) {
+    be_pushnil(vm);
+    be_return(vm);
+  }
+
+  /*
+   * be_newobject("map") deixa:
+   *
+   *   map_instance
+   *   map_internal_p
+   */
+  be_newobject(vm, "map");
+
+  // Group
+  be_pushstring(vm, "Group");
+  be_pushint(vm, index);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // Valid
+  be_pushstring(vm, "Valid");
+  be_pushint(vm, valid);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // Power
+  be_pushstring(vm, "Power");
+  be_pushint(vm, power);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // PowerValid
+  be_pushstring(vm, "PowerValid");
+  be_pushint(vm, (valid & 0x01) ? 1 : 0);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // Bri
+  be_pushstring(vm, "Bri");
+  be_pushint(vm, bri);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // BriValid
+  be_pushstring(vm, "BriValid");
+  be_pushint(vm, (valid & 0x02) ? 1 : 0);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // CT
+  be_pushstring(vm, "CT");
+  be_pushint(vm, ct);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // Age
+  be_pushstring(vm, "Age");
+  be_pushint(vm, age);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  // ChannelsValid
+  be_pushstring(vm, "ChannelsValid");
+  be_pushint(vm, (valid & 0x04) ? 1 : 0);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  /*
+   * Agora:
+   *
+   * map_instance
+   * map_internal_p
+   */
+
+  // chave que receberá a lista
+  be_pushstring(vm, "Channels");
+
+  /*
+   * Stack:
+   *
+   * map_instance
+   * map_internal_p
+   * "Channels"
+   */
+
+  be_newobject(vm, "list");
+
+  /*
+   * Stack:
+   *
+   * map_instance
+   * map_internal_p
+   * "Channels"
+   * list_instance
+   * list_internal_p
+   */
+
+  for (int i = 0; i < 5; i++) {
+    be_pushint(vm, channels[i]);
+
+    // -2 = list_internal_p
+    be_data_push(vm, -2);
+
+    // be_data_push não remove o valor
+    be_pop(vm, 1);
+  }
+
+  /*
+   * Remove list_internal_p.
+   *
+   * Fica:
+   *
+   * map_instance
+   * map_internal_p
+   * "Channels"
+   * list_instance
+   */
+  be_pop(vm, 1);
+
+  /*
+   * map_internal_p["Channels"] = list_instance
+   *
+   * -3 = map_internal_p
+   */
+  be_data_insert(vm, -3);
+
+  // remove "Channels" e list_instance
+  be_pop(vm, 2);
+
+  /*
+   * Agora:
+   *
+   * map_instance
+   * map_internal_p
+   */
+
+  // remove internal_p
+  be_pop(vm, 1);
+
+  /*
+   * Agora somente map_instance está no topo.
+   */
+  be_return(vm);
+}
+
+static int l_devgroup_member_shadow(bvm *vm)
+{
+  int32_t group_index = 0;
+  int32_t member_index = 0;
+
+  if (be_top(vm) >= 2) {
+    group_index = be_toint(vm, 2);
+  }
+
+  if (be_top(vm) >= 3) {
+    member_index = be_toint(vm, 3);
+  }
+
+  if (group_index < 0 ||
+      group_index > 255 ||
+      member_index < 0 ||
+      member_index > 255) {
+    be_pushnil(vm);
+    be_return(vm);
+  }
+
+  uint32_t ip = 0;
+  uint8_t valid = 0;
+  uint32_t power = 0;
+  uint8_t bri = 0;
+  uint8_t channels[6] = {0};
+  uint16_t ct = 0;
+  uint32_t age = 0;
+
+  bool ok = DeviceGroupGetMemberShadow(
+    (uint8_t)group_index,
+    (uint8_t)member_index,
+    &ip,
+    &valid,
+    &power,
+    &bri,
+    channels,
+    &ct,
+    &age
+  );
+
+  if (!ok) {
+    be_pushnil(vm);
+    be_return(vm);
+  }
+
+  char ip_string[16];
+
+  snprintf(
+    ip_string,
+    sizeof(ip_string),
+    "%u.%u.%u.%u",
+    (unsigned)((ip >> 24) & 0xFF),
+    (unsigned)((ip >> 16) & 0xFF),
+    (unsigned)((ip >> 8) & 0xFF),
+    (unsigned)(ip & 0xFF)
+  );
+
+  be_newobject(vm, "map");
+
+  be_pushstring(vm, "Group");
+  be_pushint(vm, group_index);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "Member");
+  be_pushint(vm, member_index);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "IP");
+  be_pushstring(vm, ip_string);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "Valid");
+  be_pushint(vm, valid);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "Power");
+  be_pushint(vm, power);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "PowerValid");
+  be_pushint(vm, (valid & 0x01) ? 1 : 0);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "Bri");
+  be_pushint(vm, bri);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "BriValid");
+  be_pushint(vm, (valid & 0x02) ? 1 : 0);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "CT");
+  be_pushint(vm, ct);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "Age");
+  be_pushint(vm, age);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "ChannelsValid");
+  be_pushint(vm, (valid & 0x04) ? 1 : 0);
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pushstring(vm, "Channels");
+
+  be_newobject(vm, "list");
+
+  for (int i = 0; i < 5; i++) {
+    be_pushint(vm, channels[i]);
+    be_data_push(vm, -2);
+    be_pop(vm, 1);
+  }
+
+  be_pop(vm, 1);
+
+  be_data_insert(vm, -3);
+  be_pop(vm, 2);
+
+  be_pop(vm, 1);
+
+  be_return(vm);
+}
 
 extern struct TasmotaGlobal_t TasmotaGlobal;
 extern struct TSettings * Settings;
@@ -78,6 +400,7 @@ BE_FUNC_CTYPE_DECLARE(be_Tasmota_version, "i", "-");
 #include "solidify/solidified_trigger_class.h"
 
 #include "be_fixed_be_class_tasmota.h"
+
 
 /* @const_object_info_begin
 class be_class_tasmota (scope: global, name: Tasmota) {
@@ -151,6 +474,8 @@ class be_class_tasmota (scope: global, name: Tasmota) {
 
     int, static_closure(class_Tasmota_int_closure)
 
+    devgroup_shadow, func(l_devgroup_shadow)
+    devgroup_member_shadow, func(l_devgroup_member_shadow)
     get_power, func(l_getpower)
     set_power, func(l_setpower)
     get_switch, func(l_getswitch)     // deprecated

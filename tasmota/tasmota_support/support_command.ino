@@ -3108,11 +3108,42 @@ void CmndDevGroupSend(void)
 
 void CmndDevGroupShare(void)
 {
-  uint32_t parm[2] = { Settings->device_group_share_in, Settings->device_group_share_out };
-  ParseParameters(2, parm);
+  uint32_t parm[3] = {
+    Settings->device_group_share_in,
+    DeviceGroupShareOutMask(
+      Settings->device_group_share_out
+    ),
+    DeviceGroupShareStatusMask(
+      Settings->device_group_share_out
+    )
+  };
+
+  ParseParameters(3, parm);
+
   Settings->device_group_share_in = parm[0];
-  Settings->device_group_share_out = parm[1];
-  Response_P(PSTR("{\"" D_CMND_DEVGROUP_SHARE "\":{\"In\":\"%X\",\"Out\":\"%X\"}}"), Settings->device_group_share_in, Settings->device_group_share_out);
+
+  Settings->device_group_share_out =
+    DeviceGroupSharePack(
+      parm[1],
+      parm[2]
+    );
+
+  Response_P(
+    PSTR(
+      "{\"" D_CMND_DEVGROUP_SHARE "\":{"
+        "\"In\":\"%X\","
+        "\"Out\":\"%X\","
+        "\"Status\":\"%X\""
+      "}}"
+    ),
+    Settings->device_group_share_in,
+    DeviceGroupShareOutMask(
+      Settings->device_group_share_out
+    ),
+    DeviceGroupShareStatusMask(
+      Settings->device_group_share_out
+    )
+  );
 }
 
 void CmndDevGroupStatus(void)

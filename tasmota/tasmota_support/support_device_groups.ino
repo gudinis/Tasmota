@@ -32,12 +32,38 @@
 
 const char kDeviceGroupMessage[] PROGMEM = DEVICE_GROUP_MESSAGE;
 
+#define DGR_SHADOW_VALID_POWER     0x01
+#define DGR_SHADOW_VALID_BRI       0x02
+#define DGR_SHADOW_VALID_CHANNELS  0x04
+
+struct device_group_shadow {
+  uint32_t power;
+
+  // Timestamp of the last update of any tracked field.
+  // Kept for compatibility with the group/Berry shadow getter.
+  uint32_t last_update;
+
+  // Per-field timestamps let us distinguish a recently reported Power
+  // from old brightness/color data (and vice-versa).
+  uint32_t power_update;
+  uint32_t bri_update;
+  uint32_t channels_update;
+
+  uint8_t bri;
+
+  // R, G, B, Cold White, Warm White, Sequence
+  uint8_t channels[6];
+
+  uint8_t valid;
+};
+
 struct device_group_member {
   struct device_group_member * flink;
   IPAddress ip_address;
   uint16_t received_sequence;
   uint16_t acked_sequence;
   uint32_t unicast_count;
+  struct device_group_shadow shadow;
 };
 
 struct device_group {
@@ -55,6 +81,7 @@ struct device_group {
   char group_name[TOPSZ];
   uint8_t message[128];
   struct device_group_member * device_group_members;
+  struct device_group_shadow shadow;
 #ifdef USE_DEVICE_GROUPS_SEND
   uint8_t values_8bit[DGR_ITEM_LAST_8BIT];
   uint16_t values_16bit[DGR_ITEM_LAST_16BIT - DGR_ITEM_MAX_8BIT - 1];
@@ -64,6 +91,143 @@ struct device_group {
 
 WiFiUDP device_groups_udp;
 struct device_group * device_groups;
+
+#ifdef ESP32
+extern "C" bool DeviceGroupGetShadow(
+  uint8_t index,
+  uint8_t *valid,
+  uint32_t *power,
+  uint8_t *bri,
+  uint8_t channels[6],
+  uint16_t *ct,
+  uint32_t *age
+) {
+  if (!Settings->flag4.device_groups_enabled ||
+      index >= device_group_count) {
+    return false;
+  }
+
+  struct device_group *device_group = &device_groups[index];
+
+  if (valid) {
+    *valid = device_group->shadow.valid;
+  }
+
+  if (power) {
+    *power = device_group->shadow.power & 1;
+  }
+
+  if (bri) {
+    *bri = device_group->shadow.bri;
+  }
+
+  if (channels) {
+    memcpy(channels, device_group->shadow.channels, 6);
+  }
+
+  if (age) {
+    *age = device_group->shadow.last_update
+      ? millis() - device_group->shadow.last_update
+      : 0;
+  }
+
+  if (ct) {
+    uint16_t cw = device_group->shadow.channels[3];
+    uint16_t ww = device_group->shadow.channels[4];
+    uint16_t total = cw + ww;
+
+    if (total) {
+      *ct = 153 +
+        ((uint32_t)ww * (500 - 153)) /
+        total;
+    } else {
+      *ct = 0;
+    }
+  }
+
+  return true;
+}
+extern "C" bool DeviceGroupGetMemberShadow(
+  uint8_t group_index,
+  uint8_t member_index,
+  uint32_t *ip,
+  uint8_t *valid,
+  uint32_t *power,
+  uint8_t *bri,
+  uint8_t channels[6],
+  uint16_t *ct,
+  uint32_t *age
+) {
+  if (!Settings->flag4.device_groups_enabled ||
+      group_index >= device_group_count) {
+    return false;
+  }
+
+  struct device_group *group = &device_groups[group_index];
+
+  // Os membros do Device Groups são uma linked list.
+  struct device_group_member *member =
+      group->device_group_members;
+
+  uint8_t current_index = 0;
+
+  while (member && current_index < member_index) {
+    member = member->flink;
+    current_index++;
+  }
+
+  // Índice solicitado não existe
+  if (!member) {
+    return false;
+  }
+
+  if (ip) {
+    *ip =
+      ((uint32_t)member->ip_address[0] << 24) |
+      ((uint32_t)member->ip_address[1] << 16) |
+      ((uint32_t)member->ip_address[2] << 8) |
+      ((uint32_t)member->ip_address[3]);
+  }
+
+  struct device_group_shadow *shadow =
+      &member->shadow;
+
+  if (valid) {
+    *valid = shadow->valid;
+  }
+
+  if (power) {
+    *power = shadow->power & 1;
+  }
+
+  if (bri) {
+    *bri = shadow->bri;
+  }
+
+  if (channels) {
+    memcpy(channels, shadow->channels, 6);
+  }
+
+  if (age) {
+    *age = shadow->last_update
+      ? millis() - shadow->last_update
+      : 0;
+  }
+
+  if (ct) {
+    uint16_t cw = shadow->channels[3];
+    uint16_t ww = shadow->channels[4];
+    uint16_t total = cw + ww;
+
+    *ct = total
+      ? 153 + ((uint32_t)ww * (500 - 153)) / total
+      : 0;
+  }
+
+  return true;
+}
+#endif
+
 uint32_t next_check_time;
 bool device_groups_initialized = false;
 bool device_groups_up = false;
@@ -106,6 +270,72 @@ uint32_t DeviceGroupSharedMask(uint8_t item)
   else if (item == DGR_ITEM_EVENT)
     mask = DGR_SHARE_EVENT;
   return mask;
+}
+
+bool DeviceGroupUpdateShadow(
+    struct device_group_shadow *shadow,
+    uint8_t item,
+    int32_t value,
+    const char *data,
+    uint32_t data_len)
+{
+  if (!shadow) {
+    return false;
+  }
+
+  bool changed = false;
+  uint32_t now = millis();
+
+  switch (item) {
+
+    case DGR_ITEM_POWER: {
+      uint32_t new_power = value & 0x00FFFFFF;
+
+      if (!(shadow->valid & DGR_SHADOW_VALID_POWER) ||
+          shadow->power != new_power) {
+        changed = true;
+      }
+
+      shadow->power = new_power;
+      shadow->valid |= DGR_SHADOW_VALID_POWER;
+      shadow->power_update = now;
+      break;
+    }
+
+    case DGR_ITEM_LIGHT_BRI: {
+      uint8_t new_bri = (uint8_t)value;
+
+      if (!(shadow->valid & DGR_SHADOW_VALID_BRI) ||
+          shadow->bri != new_bri) {
+        changed = true;
+      }
+
+      shadow->bri = new_bri;
+      shadow->valid |= DGR_SHADOW_VALID_BRI;
+      shadow->bri_update = now;
+      break;
+    }
+
+    case DGR_ITEM_LIGHT_CHANNELS:
+      if (data && data_len >= 6) {
+
+        if (!(shadow->valid & DGR_SHADOW_VALID_CHANNELS) ||
+            memcmp(shadow->channels, data, 6)) {
+          changed = true;
+        }
+
+        memcpy(shadow->channels, data, 6);
+        shadow->valid |= DGR_SHADOW_VALID_CHANNELS;
+        shadow->channels_update = now;
+      }
+      break;
+  }
+
+  if (changed) {
+    shadow->last_update = now;
+  }
+
+  return changed;
 }
 
 void DeviceGroupsInit(void)
@@ -159,8 +389,16 @@ void DeviceGroupsInit(void)
   }
 
   // If both in and out shared items masks are 0, assume they're unitialized and initialize them.
-  if (!Settings->device_group_share_in && !Settings->device_group_share_out) {
-    Settings->device_group_share_in = Settings->device_group_share_out = 0xffffffff;
+  if (!Settings->device_group_share_in &&
+    !Settings->device_group_share_out) {
+
+    Settings->device_group_share_in = 0xffffffff;
+
+    Settings->device_group_share_out =
+      DeviceGroupSharePack(
+        0x0FFF,
+        0
+      );
   }
 
   device_groups_initialized = true;
@@ -210,6 +448,122 @@ void DeviceGroupsStop()
   device_groups_udp.flush();
   device_groups_up = false;
 }
+
+#ifdef ESP32
+void DeviceGroupShadowBerryEvent(
+    uint8_t group_index,
+    struct device_group_member *member,
+    uint8_t item)
+{
+#ifdef USE_BERRY
+
+  if (group_index >= device_group_count) {
+    return;
+  }
+
+  struct device_group *group =
+      &device_groups[group_index];
+
+  struct device_group_shadow *shadow =
+      member
+        ? &member->shadow
+        : &group->shadow;
+
+  const char *ip_string =
+      member
+        ? IPAddressToString(member->ip_address)
+        : "";
+
+  int member_index = -1;
+
+  if (member) {
+    struct device_group_member *current =
+        group->device_group_members;
+
+    int index = 0;
+
+    while (current) {
+      if (current == member) {
+        member_index = index;
+        break;
+      }
+
+      current = current->flink;
+      index++;
+    }
+  }
+
+  uint16_t ct = 0;
+
+  uint16_t cw = shadow->channels[3];
+  uint16_t ww = shadow->channels[4];
+  uint16_t total = cw + ww;
+
+  if (total) {
+    ct =
+      153 +
+      ((uint32_t)ww * (500 - 153)) /
+      total;
+  }
+
+  struct XDRVMAILBOX saved_mailbox = XdrvMailbox;
+
+  Response_P(
+    PSTR(
+      "{\"DevGroupShadow\":{"
+        "\"Group\":%u,"
+        "\"Name\":\"%s\","
+        "\"Member\":%d,"
+        "\"IP\":\"%s\","
+        "\"Item\":%u,"
+        "\"Valid\":%u,"
+        "\"Power\":%u,"
+        "\"PowerValid\":%u,"
+        "\"Bri\":%u,"
+        "\"BriValid\":%u,"
+        "\"Channels\":[%u,%u,%u,%u,%u],"
+        "\"ChannelsValid\":%u,"
+        "\"Sequence\":%u,"
+        "\"CT\":%u"
+      "}}"
+    ),
+
+    group_index,
+    group->group_name,
+    member_index,
+    ip_string,
+    item,
+
+    shadow->valid,
+
+    shadow->power & 1,
+    !!(shadow->valid & DGR_SHADOW_VALID_POWER),
+
+    shadow->bri,
+    !!(shadow->valid & DGR_SHADOW_VALID_BRI),
+
+    shadow->channels[0],
+    shadow->channels[1],
+    shadow->channels[2],
+    shadow->channels[3],
+    shadow->channels[4],
+
+    !!(shadow->valid & DGR_SHADOW_VALID_CHANNELS),
+
+    shadow->channels[5],
+
+    ct
+  );
+
+  XdrvMailbox.data = ResponseData();
+
+  XdrvCall(FUNC_RULES_PROCESS);
+
+  XdrvMailbox = saved_mailbox;
+
+#endif
+}
+#endif
 
 void SendReceiveDeviceGroupMessage(struct device_group * device_group, struct device_group_member * device_group_member, uint8_t * message, int message_length, bool received)
 {
@@ -395,51 +749,165 @@ void SendReceiveDeviceGroupMessage(struct device_group * device_group, struct de
         continue;
       }
 
-      mask = DeviceGroupSharedMask(item);
-      if (item_flags & DGR_ITEM_FLAG_NO_SHARE)
-        device_group->no_status_share |= mask;
-      else
-        device_group->no_status_share &= ~mask;
+      // Diagnostic: show the exact POWER value and sender before it is stored.
+      // This tells us whether a wrong Power value originates in the packet or in the shadow logic.
+      if (item == DGR_ITEM_POWER) {
+        AddLog(
+          LOG_LEVEL_INFO,
+          PSTR("DGR: POWER from %s value=%u raw=0x%08X"),
+          device_group_member ? IPAddressToString(device_group_member->ip_address) : PSTR("local"),
+          value & 1,
+          (uint32_t)value
+        );
+      }
 
-      if ((!(device_group->no_status_share & mask) || device_group_member == nullptr) && (!mask || (mask & Settings->device_group_share_in))) {
-        item_processed = true;
-        XdrvMailbox.command_code = item;
-        XdrvMailbox.payload = value;
-        XdrvMailbox.data_len = value;
-        *log_ptr++ = '*';
-        log_remaining--;
-        switch (item) {
-          case DGR_ITEM_POWER:
-            if (Settings->flag4.multiple_device_groups) {  // SetOption88 - Enable relays in separate device groups
-              uint32_t device = Settings->device_group_tie[device_group_index];
-              if (device && device <= TasmotaGlobal.devices_present) {
-                bool on = (value & 1);
-                if (on != ((TasmotaGlobal.power >> (device - 1)) & 1)) ExecuteCommandPower(device, (on ? POWER_ON : POWER_OFF), SRC_REMOTE);
-              }
-            }
-            else if (XdrvMailbox.index & DGR_FLAG_LOCAL) {
-              uint8_t mask_devices = value >> 24;
-              if (mask_devices > TasmotaGlobal.devices_present) mask_devices = TasmotaGlobal.devices_present;
-              for (uint32_t i = 0; i < mask_devices; i++) {
-                uint32_t mask = 1 << i;
-                bool on = (value & mask);
-                if (on != (TasmotaGlobal.power & mask)) ExecuteCommandPower(i + 1, (on ? POWER_ON : POWER_OFF), SRC_REMOTE);
-              }
-            }
-            break;
-          case DGR_ITEM_NO_STATUS_SHARE:
-            device_group->no_status_share = value;
-            break;
-#ifdef USE_RULES
-          case DGR_ITEM_EVENT:
-            CmndEvent();
-            break;
-#endif
-          case DGR_ITEM_COMMAND:
-            ExecuteCommand(XdrvMailbox.data, SRC_REMOTE);
-            break;
+      bool group_shadow_changed =
+          DeviceGroupUpdateShadow(
+              &device_group->shadow,
+              item,
+              value,
+              XdrvMailbox.data,
+              value
+          );
+
+      bool member_shadow_changed = false;
+
+      if (device_group_member) {
+        member_shadow_changed =
+            DeviceGroupUpdateShadow(
+                &device_group_member->shadow,
+                item,
+                value,
+                XdrvMailbox.data,
+                value
+            );
+      }
+
+      if (device_group_member) {
+
+        if (member_shadow_changed) {
+          DeviceGroupShadowBerryEvent(
+              device_group_index,
+              device_group_member,
+              item
+          );
         }
-        XdrvCall(FUNC_DEVICE_GROUP_ITEM);
+
+      }
+      else if (group_shadow_changed) {
+
+        DeviceGroupShadowBerryEvent(
+            device_group_index,
+            nullptr,
+            item
+        );
+      }
+
+      mask = DeviceGroupSharedMask(item);
+
+      bool status_only =
+          item_flags & DGR_ITEM_FLAG_STATUS_ONLY;
+
+      if (!status_only) {
+
+        if (item_flags & DGR_ITEM_FLAG_NO_SHARE)
+          device_group->no_status_share |= mask;
+        else
+          device_group->no_status_share &= ~mask;
+
+        if ((!(device_group->no_status_share & mask) ||
+            device_group_member == nullptr) &&
+            (!mask ||
+            (mask & Settings->device_group_share_in))) {
+
+          item_processed = true;
+
+          XdrvMailbox.command_code = item;
+          XdrvMailbox.payload = value;
+          XdrvMailbox.data_len = value;
+
+          *log_ptr++ = '*';
+          log_remaining--;
+
+          switch (item) {
+
+            case DGR_ITEM_POWER:
+              if (Settings->flag4.multiple_device_groups) {
+                uint32_t device =
+                  Settings->device_group_tie[
+                    device_group_index
+                  ];
+
+                if (device &&
+                    device <= TasmotaGlobal.devices_present) {
+
+                  bool on = value & 1;
+
+                  if (on !=
+                      ((TasmotaGlobal.power >>
+                        (device - 1)) & 1)) {
+
+                    ExecuteCommandPower(
+                      device,
+                      on ? POWER_ON : POWER_OFF,
+                      SRC_REMOTE
+                    );
+                  }
+                }
+              }
+
+              else if (XdrvMailbox.index &
+                      DGR_FLAG_LOCAL) {
+
+                uint8_t mask_devices = value >> 24;
+
+                if (mask_devices >
+                    TasmotaGlobal.devices_present) {
+                  mask_devices =
+                    TasmotaGlobal.devices_present;
+                }
+
+                for (uint32_t i = 0;
+                    i < mask_devices;
+                    i++) {
+
+                  uint32_t device_mask = 1 << i;
+                  bool on = value & device_mask;
+
+                  if (on !=
+                      (TasmotaGlobal.power &
+                      device_mask)) {
+
+                    ExecuteCommandPower(
+                      i + 1,
+                      on ? POWER_ON : POWER_OFF,
+                      SRC_REMOTE
+                    );
+                  }
+                }
+              }
+              break;
+
+            case DGR_ITEM_NO_STATUS_SHARE:
+              device_group->no_status_share = value;
+              break;
+
+      #ifdef USE_RULES
+            case DGR_ITEM_EVENT:
+              CmndEvent();
+              break;
+      #endif
+
+            case DGR_ITEM_COMMAND:
+              ExecuteCommand(
+                XdrvMailbox.data,
+                SRC_REMOTE
+              );
+              break;
+          }
+
+          XdrvCall(FUNC_DEVICE_GROUP_ITEM);
+        }
       }
       item_flags = 0;
     }
@@ -607,6 +1075,11 @@ bool _SendDeviceGroupMessage(int32_t device, DevGroupMessageType message_type, .
           item_ptr->flags = DGR_ITEM_FLAG_NO_SHARE;
         }
 
+        if (toupper(*value_ptr) == 'S') {
+          value_ptr++;
+          item_ptr->flags |= DGR_ITEM_FLAG_STATUS_ONLY;
+        }
+
         if (item <= DGR_ITEM_MAX_32BIT) {
           oper = 0;
           if (*value_ptr == '@') {
@@ -708,6 +1181,7 @@ bool _SendDeviceGroupMessage(int32_t device, DevGroupMessageType message_type, .
         // If this is the flags item, save the flags.
         if (item == DGR_ITEM_FLAGS) {
           item_flags = *previous_message_ptr++;
+          continue;
         }
 
         // Otherwise, determine the length of this item's value.
@@ -758,13 +1232,64 @@ bool _SendDeviceGroupMessage(int32_t device, DevGroupMessageType message_type, .
 
       // If this item is shared with the group add it to the message.
       shared = true;
+
       if ((mask = DeviceGroupSharedMask(item))) {
-        if (item_ptr->flags & DGR_ITEM_FLAG_NO_SHARE)
+
+        if (item_ptr->flags & DGR_ITEM_FLAG_NO_SHARE) {
           device_group->no_status_share |= mask;
-        else if (!building_status_message)
+        }
+
+        else if (!building_status_message) {
           device_group->no_status_share &= ~mask;
+        }
+
         if (message_type != DGR_MSGTYPE_UPDATE_COMMAND) {
-          shared = (!(mask & device_group->no_status_share) && (device_group_index || (mask & Settings->device_group_share_out)));
+
+          uint32_t share_out =
+            DeviceGroupShareOutMask(
+              Settings->device_group_share_out
+            );
+
+          uint32_t share_status =
+            DeviceGroupShareStatusMask(
+              Settings->device_group_share_out
+            );
+
+          bool normal_out =
+            mask & share_out;
+
+          bool status_out =
+            mask & share_status;
+
+          shared =
+            !(mask & device_group->no_status_share) &&
+            (normal_out || status_out);
+
+          if (shared &&
+              !normal_out &&
+              status_out) {
+
+            item_ptr->flags |=
+              DGR_ITEM_FLAG_STATUS_ONLY;
+          }
+        }
+      }
+      if (building_status_message &&
+          item == DGR_ITEM_NO_STATUS_SHARE) {
+
+        uint32_t share_out =
+          DeviceGroupShareOutMask(
+            Settings->device_group_share_out
+          );
+
+        uint32_t share_status =
+          DeviceGroupShareStatusMask(
+            Settings->device_group_share_out
+          );
+
+        if (!share_out && share_status) {
+          item_ptr->flags |=
+            DGR_ITEM_FLAG_STATUS_ONLY;
         }
       }
       if (shared) {
@@ -901,16 +1426,165 @@ void ProcessDeviceGroupMessage(uint8_t * message, int message_length)
 
 void DeviceGroupStatus(uint8_t device_group_index)
 {
-  if (Settings->flag4.device_groups_enabled && device_group_index < device_group_count) {
-    char buffer[1024];
+  if (Settings->flag4.device_groups_enabled &&
+      device_group_index < device_group_count) {
+
+    char buffer[2048];
     int member_count = 0;
-    struct device_group * device_group = &device_groups[device_group_index];
+
+    struct device_group *device_group =
+      &device_groups[device_group_index];
+
     buffer[0] = buffer[1] = 0;
-    for (struct device_group_member * device_group_member = device_group->device_group_members; device_group_member; device_group_member = device_group_member->flink) {
-      snprintf_P(buffer, sizeof(buffer), PSTR("%s,{\"IPAddress\":\"%s\",\"ResendCount\":%u,\"LastRcvdSeq\":%u,\"LastAckedSeq\":%u}"), buffer, IPAddressToString(device_group_member->ip_address), device_group_member->unicast_count, device_group_member->received_sequence, device_group_member->acked_sequence);
+
+    for (struct device_group_member *device_group_member =
+           device_group->device_group_members;
+         device_group_member;
+         device_group_member = device_group_member->flink) {
+
+      uint16_t member_ct = 0;
+      uint16_t member_cw = device_group_member->shadow.channels[3];
+      uint16_t member_ww = device_group_member->shadow.channels[4];
+      uint16_t member_white_total = member_cw + member_ww;
+      if (member_white_total) {
+        member_ct = 153 +
+          ((uint32_t)member_ww * (500 - 153)) / member_white_total;
+      }
+
+      uint32_t power_age = device_group_member->shadow.power_update
+        ? millis() - device_group_member->shadow.power_update : 0;
+      uint32_t bri_age = device_group_member->shadow.bri_update
+        ? millis() - device_group_member->shadow.bri_update : 0;
+      uint32_t channels_age = device_group_member->shadow.channels_update
+        ? millis() - device_group_member->shadow.channels_update : 0;
+
+      snprintf_P(
+        buffer,
+        sizeof(buffer),
+        PSTR(
+          "%s,"
+          "{\"IPAddress\":\"%s\","
+          "\"Valid\":%u,"
+          "\"Power\":%u,"
+          "\"PowerValid\":%u,"
+          "\"PowerAge\":%u,"
+          "\"Bri\":%u,"
+          "\"BriValid\":%u,"
+          "\"BriAge\":%u,"
+          "\"Channels\":[%u,%u,%u,%u,%u],"
+          "\"ChannelsValid\":%u,"
+          "\"ChannelsAge\":%u,"
+          "\"Sequence\":%u,"
+          "\"CT\":%u,"
+          "\"Age\":%u,"
+          "\"ResendCount\":%u,"
+          "\"LastRcvdSeq\":%u,"
+          "\"LastAckedSeq\":%u}"
+        ),
+        buffer,
+        IPAddressToString(device_group_member->ip_address),
+        device_group_member->shadow.valid,
+        device_group_member->shadow.power & 1,
+        !!(device_group_member->shadow.valid & DGR_SHADOW_VALID_POWER),
+        power_age,
+        device_group_member->shadow.bri,
+        !!(device_group_member->shadow.valid & DGR_SHADOW_VALID_BRI),
+        bri_age,
+        device_group_member->shadow.channels[0],
+        device_group_member->shadow.channels[1],
+        device_group_member->shadow.channels[2],
+        device_group_member->shadow.channels[3],
+        device_group_member->shadow.channels[4],
+        !!(device_group_member->shadow.valid & DGR_SHADOW_VALID_CHANNELS),
+        channels_age,
+        device_group_member->shadow.channels[5],
+        member_ct,
+        device_group_member->shadow.last_update
+          ? millis() - device_group_member->shadow.last_update : 0,
+        device_group_member->unicast_count,
+        device_group_member->received_sequence,
+        device_group_member->acked_sequence
+      );
+
       member_count++;
     }
-    Response_P(PSTR("{\"" D_CMND_DEVGROUPSTATUS "\":{\"Index\":%u,\"GroupName\":\"%s\",\"MessageSeq\":%u,\"MemberCount\":%d,\"Members\":[%s]}}"), device_group_index, device_group->group_name, device_group->outgoing_sequence, member_count, &buffer[1]);
+
+    uint32_t shadow_age = 0;
+
+    if (device_group->shadow.last_update) {
+      shadow_age =
+        millis() - device_group->shadow.last_update;
+    }
+
+    uint16_t shadow_ct = 0;
+
+    uint16_t cw = device_group->shadow.channels[3];
+    uint16_t ww = device_group->shadow.channels[4];
+    uint16_t white_total = cw + ww;
+
+    /*
+     * Tasmota standard CT range:
+     *
+     * 153 mired ~= 6500K
+     * 500 mired ~= 2000K
+     *
+     * CW -> CT_MIN
+     * WW -> CT_MAX
+     */
+    if (white_total) {
+      shadow_ct =
+        153 +
+        ((uint32_t)ww * (500 - 153)) /
+        white_total;
+    }
+
+    Response_P(
+      PSTR(
+        "{\"" D_CMND_DEVGROUPSTATUS "\":{"
+          "\"Index\":%u,"
+          "\"GroupName\":\"%s\","
+          "\"MessageSeq\":%u,"
+
+          "\"Shadow\":{"
+            "\"Valid\":%u,"
+            "\"Power\":%u,"
+            "\"Bri\":%u,"
+            "\"Channels\":[%u,%u,%u,%u,%u],"
+            "\"Sequence\":%u,"
+            "\"CT\":%u,"
+            "\"Age\":%u"
+          "},"
+
+          "\"MemberCount\":%d,"
+          "\"Members\":[%s]"
+        "}}"
+      ),
+
+      device_group_index,
+      device_group->group_name,
+      device_group->outgoing_sequence,
+
+      device_group->shadow.valid,
+
+      device_group->shadow.power & 1,
+
+      device_group->shadow.bri,
+
+      device_group->shadow.channels[0],
+      device_group->shadow.channels[1],
+      device_group->shadow.channels[2],
+      device_group->shadow.channels[3],
+      device_group->shadow.channels[4],
+
+      device_group->shadow.channels[5],
+
+      shadow_ct,
+
+      shadow_age,
+
+      member_count,
+      &buffer[1]
+    );
   }
 }
 

@@ -540,10 +540,55 @@ enum DevGroupItem { DGR_ITEM_EOL, DGR_ITEM_STATUS, DGR_ITEM_FLAGS,
                     DGR_ITEM_LAST_STRING, DGR_ITEM_MAX_STRING = 223,
                     DGR_ITEM_LIGHT_CHANNELS };
 
-enum DevGroupItemFlag { DGR_ITEM_FLAG_NO_SHARE = 1 };
+enum DevGroupItemFlag {
+  DGR_ITEM_FLAG_NO_SHARE   = 1,
+  DGR_ITEM_FLAG_STATUS_ONLY = 2
+};
 
 enum DevGroupShareItem { DGR_SHARE_POWER = 1, DGR_SHARE_LIGHT_BRI = 2, DGR_SHARE_LIGHT_FADE = 4, DGR_SHARE_LIGHT_SCHEME = 8,
                          DGR_SHARE_LIGHT_COLOR = 16, DGR_SHARE_DIMMER_SETTINGS = 32, DGR_SHARE_EVENT = 64 };
+
+#define DGR_SHARE_CONFIG_MAGIC_MASK      0xFF000000UL
+#define DGR_SHARE_CONFIG_MAGIC           0xD6000000UL
+
+#define DGR_SHARE_CONFIG_VALUE_MASK      0x00000FFFUL
+
+#define DGR_SHARE_STATUS_SHIFT           12
+#define DGR_SHARE_STATUS_MASK            0x00FFF000UL
+
+inline bool DeviceGroupShareIsPacked(uint32_t value) {
+  return (value & DGR_SHARE_CONFIG_MAGIC_MASK) ==
+         DGR_SHARE_CONFIG_MAGIC;
+}
+
+inline uint32_t DeviceGroupShareOutMask(uint32_t value) {
+  if (DeviceGroupShareIsPacked(value)) {
+    return value & DGR_SHARE_CONFIG_VALUE_MASK;
+  }
+
+  return value;
+}
+
+inline uint32_t DeviceGroupShareStatusMask(uint32_t value) {
+  if (!DeviceGroupShareIsPacked(value)) {
+    return 0;
+  }
+
+  return
+    (value >> DGR_SHARE_STATUS_SHIFT) &
+    DGR_SHARE_CONFIG_VALUE_MASK;
+}
+
+inline uint32_t DeviceGroupSharePack(
+    uint32_t share_out,
+    uint32_t share_status) {
+
+  return
+    DGR_SHARE_CONFIG_MAGIC |
+    (share_out & DGR_SHARE_CONFIG_VALUE_MASK) |
+    ((share_status & DGR_SHARE_CONFIG_VALUE_MASK)
+      << DGR_SHARE_STATUS_SHIFT);
+}
 
 enum CommandSource { SRC_IGNORE, SRC_MQTT, SRC_RESTART, SRC_BUTTON, SRC_SWITCH, SRC_BACKLOG, SRC_SERIAL, SRC_WEBGUI, SRC_WEBCOMMAND, SRC_WEBCONSOLE, SRC_PULSETIMER,
                      SRC_TIMER, SRC_RULE, SRC_MAXPOWER, SRC_MAXENERGY, SRC_OVERTEMP, SRC_LIGHT, SRC_KNX, SRC_DISPLAY, SRC_WEMO, SRC_HUE, SRC_RETRY, SRC_REMOTE, SRC_SHUTTER,
